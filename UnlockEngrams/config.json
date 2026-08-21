@@ -1,0 +1,35 @@
+{
+  "_read_this": [
+    "UnlockEngrams — one chat command that unlocks every building and crafting",
+    "knowledge for whoever types it.",
+    "",
+    "command     what the player types. It has to start with ! — Conan's client",
+    "            swallows /command locally and never sends it to the server.",
+    "permission  empty = anybody can use it. With a Permission node (say",
+    "            \"engrams.use\") only players holding that node get through —",
+    "            and if ConanPermission.dll is not installed, NOBODY does, on",
+    "            purpose: opening it to everyone because a dependency is",
+    "            missing would be the opposite of what you asked for here.",
+    "",
+    "The four messages are what the player reads. Change them freely — this is",
+    "also where you translate the plugin, without touching a line of code.",
+    "",
+    "{n} becomes how many knowledges this run actually granted — counted one by",
+    "one and confirmed with the game afterwards, not guessed. Somebody who",
+    "already had everything sees 0, and that is correct. Leave {n} out and the",
+    "message is used exactly as written.",
+    "",
+    "msg_partial exists because knowledge in Conan is two things: the feat tree",
+    "and the recipes. If only one of them gets unlocked, saying \"done\" is a lie",
+    "in one direction and \"failed\" a lie in the other — the player would find",
+    "out which by walking to a bench. The reason goes to ConanApi.log."
+  ],
+
+  "command":    "!engrams",
+  "permission": "",
+
+  "msg_ok":      "Unlocked {n} knowledges. You can build anything now.",
+  "msg_denied":  "You are not allowed to use this command.",
+  "msg_partial": "Unlocked {n} knowledges, but not all of it. If something still won't build, tell an admin: the reason is in ConanApi.log.",
+  "msg_failed":  "I could not unlock the knowledge. Tell an admin: the reason is in ConanApi.log."
+}

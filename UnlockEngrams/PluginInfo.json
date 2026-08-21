@@ -1,0 +1,7 @@
+{
+  "FullName":      "Unlock Engrams",
+  "Description":   "One chat command that unlocks every building and crafting knowledge",
+  "Version":       "1.0.0",
+  "MinApiVersion": 6,
+  "Dependencies":  []
+}
