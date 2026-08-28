@@ -65,8 +65,10 @@ server's `config.json` — the text players read is **data**, not code. Translat
 this plugin is editing one file. See [`config.json`](#configjson).</sup>
 
 > **The padlocks that remain say "DLC missing", not "not enough points".**
-> Those are Funcom's paid packs, and this plugin does not — and will not —
-> hand them out. [Why, and how it was proved.](#why-some-feats-are-refused--and-why-that-is-correct)
+> Those are Funcom's paid packs, and by default this plugin leaves them alone —
+> the refusal is the game working, not the plugin failing. A server owner who
+> wants that lock stepped over asks for it by name, in `config.json`.
+> [Why, how it was proved, and the two switches.](#why-some-feats-are-refused--and-why-that-is-correct)
 
 <br>
 
@@ -296,8 +298,10 @@ doesn't, doesn't.
 
 ### Stepping over it — two switches, both off by default
 
-Since **2.9.0** the plugin can step over that check, and it stays off unless you
-write it down. Two keys in `config.json`, separate on purpose:
+Since **2.8.0** the plugin can step over that check, and it stays off unless you
+write it down. Two keys in `config.json`, separate on purpose — the Bazaar half
+needs **2.9.0 / table v7**, and degrades cleanly on older servers rather than
+failing quietly:
 
 | Key | Default | Covers |
 |---|---|---|
