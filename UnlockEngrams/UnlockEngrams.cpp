@@ -955,6 +955,12 @@ static const int LOAN_MAX = 128;
 // realocar memoria estatica nossa — e entao usei LOAN_MAX como tamanho do lote,
 // o que faz ArrayNum == ArrayMax == 128 em todo lote cheio. Oito dos nove lotes
 // de 1099 ficavam sem folga nenhuma: a defesa anulava a si mesma.
+// Os dois tipos que o jogo usa na chave "%d-%d" do m_OwnedDurableRewards.
+// Medidos no desmonte de SetOwnedRewards (0x50D11B0): `mov edx,1` no ramo de
+// receita (0x50D1489) e `xor edx,edx` no de item de jogo (0x50CB970).
+static const int ENTITLEMENT_TIPO_ITEM    = 0;
+static const int ENTITLEMENT_TIPO_RECEITA = 1;
+
 static const int LOAN_LOTE = 96;
 static_assert(LOAN_LOTE < LOAN_MAX,
               "o lote precisa deixar folga: com ArrayNum == ArrayMax um Add do "
@@ -1200,6 +1206,125 @@ static void* LinhaDoFeat(void* item)
     return linha;
 }
 
+// ── O VERIFICADOR QUE NAO SOU EU ────────────────────────────────────────────
+//
+// POR QUE ISTO EXISTE, e e' a licao mais cara deste arquivo
+// ---------------------------------------------------------
+// Em 28/08/2026 este plugin anunciou "1098 of 1098 granted · 0 refused" e nao
+// tinha liberado NADA. O verificador era `IsFeatPurchased`, que le' o mesmo
+// conjunto que o plugin acabara de escrever: perguntei ao conjunto se ele
+// continha o que eu tinha acabado de por nele. O teste nao podia falhar, e por
+// isso nao valia nada.
+//
+// Enquanto isso, o JOGO escrevia a verdade no proprio log, 1.995 vezes DEPOIS
+// do comando:
+//
+//     ItemInventory: Error: Data: Character does not own the Entitlement
+//                    1-269 for recipe 269.
+//
+// Este contador le' ESSA linha. Nao e' o plugin falando de si mesmo: e' o
+// motor do jogo recusando, do outro lado da fronteira.
+//
+// LIMITE, e esta' dito: contagem zero aqui NAO prova sucesso. Prova que o jogo
+// nao recusou NESTA JANELA — e ele so' recusa quando alguem tenta usar. A
+// prova final continua sendo a tela do jogador.
+//
+// Le' so' o que foi ACRESCENTADO desde a marca, nunca o arquivo inteiro: o
+// ConanSandbox.log passa de 10 MB e reler tudo dentro do comando travaria a
+// thread do jogo.
+// fopen_s no MSVC, fopen no MinGW: o plugin publico compila nos dois, e a
+// macro da API interna nao cruza a fronteira da tabela.
+#if defined(_MSC_VER)
+  #define ENG_FOPEN(f, nome, modo) do { if (fopen_s(&(f), (nome), (modo)) != 0) (f) = nullptr; } while (0)
+#else
+  #define ENG_FOPEN(f, nome, modo) do { (f) = std::fopen((nome), (modo)); } while (0)
+#endif
+
+static long long g_logMarca = -1;
+
+static const char* CaminhoLogDoJogo()
+{
+    // O nosso log e' .../Binaries/Win64/Conan-Api/Logs/ConanApi.log. O do JOGO
+    // fica em .../ConanSandbox/Saved/Logs/ConanSandbox.log.
+    //
+    // `CaminhoRaiz()` devolve a nossa raiz (.../Binaries/Win64/Conan-Api), e o
+    // caminho e' derivado dela em vez de escrito a mao: um literal absoluto
+    // funcionaria so' nesta maquina, e este plugin e' publicado.
+    static std::string caminho;
+    static bool tentou = false;
+    if (tentou) return caminho.empty() ? nullptr : caminho.c_str();
+    tentou = true;
+
+    const char* raiz = g_api->CaminhoRaiz ? g_api->CaminhoRaiz() : nullptr;
+    if (!raiz || !*raiz) return nullptr;
+
+    // Sobe tres: Conan-Api -> Win64 -> Binaries -> ConanSandbox
+    std::string p(raiz);
+    // Barra no fim faria o primeiro corte comer a barra e nao o diretorio,
+    // e a subida terminaria um nivel acima do certo — apontando para
+    // Binaries/Saved/Logs, que nao existe. Zero recusas lidas de um arquivo
+    // que nao existe leria como aprovacao.
+    while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
+    for (int i = 0; i < 3; ++i)
+    {
+        const size_t corte = p.find_last_of("\\/");
+        if (corte == std::string::npos) return nullptr;
+        p.erase(corte);
+    }
+    p += "\\Saved\\Logs\\ConanSandbox.log";
+
+    // Existe mesmo? Se nao, melhor devolver nada do que contar num arquivo
+    // errado e chamar zero de aprovacao.
+    FILE* teste = nullptr;
+    ENG_FOPEN(teste, p.c_str(), "rb");
+    if (!teste)
+    {
+        g_api->Log("[engrams]   nao achei o log do jogo em \"%s\" — o contador "
+                   "independente fica indisponivel (e ausencia dele NAO e' "
+                   "aprovacao)", p.c_str());
+        return nullptr;
+    }
+    std::fclose(teste);
+    caminho = p;
+    return caminho.c_str();
+}
+
+// Marca o fim do arquivo. Tudo que aparecer depois disto e' desta tentativa.
+static void MarcarLogDoJogo()
+{
+    g_logMarca = -1;
+    const char* c = CaminhoLogDoJogo();
+    if (!c) return;
+    FILE* f = nullptr;
+    ENG_FOPEN(f, c, "rb");
+    if (!f) return;
+    if (std::fseek(f, 0, SEEK_END) == 0) g_logMarca = std::ftell(f);
+    std::fclose(f);
+}
+
+// Conta as recusas que o JOGO registrou desde a marca.
+static int RecusasDoJogoDesdeAMarca()
+{
+    if (g_logMarca < 0) return -1;              // -1 = nao consegui conferir
+    const char* c = CaminhoLogDoJogo();
+    if (!c) return -1;
+    FILE* f = nullptr;
+    ENG_FOPEN(f, c, "rb");
+    if (!f) return -1;
+
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return -1; }
+    const long long fim = std::ftell(f);
+    if (fim < g_logMarca) { std::fclose(f); return -1; }   // rotacionou: nao sei
+    if (std::fseek(f, long(g_logMarca), SEEK_SET) != 0) { std::fclose(f); return -1; }
+
+    int n = 0;
+    char linha[2048];
+    while (std::fgets(linha, int(sizeof(linha)), f))
+        if (std::strstr(linha, "does not own the Entitlement")) ++n;
+    std::fclose(f);
+    return n;
+}
+
 // ── the Bazaar leg: trying the refused feats BY ID ──────────────────────────
 //
 // WHAT IS ALREADY KNOWN, measured, not assumed:
@@ -1224,6 +1349,10 @@ static void TryBazaarByRewardIds(void* controller, void* prog, Result& r)
 {
     if (!controller || !prog || !g_api || r.refusedIds.empty()) return;
 
+    // O jogo escreve as recusas dele no proprio log. Marcar aqui e contar no
+    // fim e' a unica leitura desta funcao que nao vem de mim.
+    MarcarLogDoJogo();
+
     const size_t total = r.refusedIds.size();
     g_api->Log("[engrams]   Bazaar: trying %d refused feat(s) BY ID, in batches "
                "of %d (buffer %d, folga proposital). Package names did not work; "
@@ -1234,14 +1363,26 @@ static void TryBazaarByRewardIds(void* controller, void* prog, Result& r)
     {
         const int n = int((total - base < size_t(LOAN_LOTE)) ? (total - base) : size_t(LOAN_LOTE));
 
-        // The ids as text, because an FName is made from text. The storage has
-        // to outlive the pointers handed to LendOwnedSet, hence two arrays.
+        // ── A CHAVE E' "tipo-id", E O SERVIDOR VINHA DIZENDO ISSO ──────────
+        //
+        // A primeira versao escrevia o id NU ("269"), e nao movia nada. O
+        // formato certo saiu do desmonte — Printf("%d-%d") na RVA 0x441CB90,
+        // com tipo 1 para receita/feat e 0 para item — e esta' confirmado do
+        // outro lado, no log do PROPRIO JOGO, 3.991 vezes:
+        //
+        //     Character does not own the Entitlement 1-269 for recipe 269
+        //
+        // Estava escrito em ingles claro no ConanSandbox.log desde o inicio,
+        // enquanto eu lia os meus proprios contadores. E o `IsFeatPurchased`
+        // nunca ia acusar a diferenca: ele le' a progressao, nao este conjunto.
         std::vector<std::string> textos((size_t)n);
         std::vector<const char*> nomes((size_t)n);
-        char buf[24];
+        char buf[32];
         for (int i = 0; i < n; ++i)
         {
-            std::snprintf(buf, sizeof(buf), "%d", r.refusedIds[base + size_t(i)]);
+            std::snprintf(buf, sizeof(buf), "%d-%d",
+                          int(ENTITLEMENT_TIPO_RECEITA),
+                          r.refusedIds[base + size_t(i)]);
             textos[(size_t)i] = buf;
             nomes[(size_t)i]  = textos[(size_t)i].c_str();
         }
@@ -1349,14 +1490,33 @@ static void TryBazaarByRewardIds(void* controller, void* prog, Result& r)
         r.bazaarWon += ganhos;
     }
 
-    if (r.bazaarWon > 0)
-        g_api->Log("[engrams]   Bazaar: %d of %d granted with the ID in the set — "
-                   "the reward set IS keyed by template id.",
-                   r.bazaarWon, r.bazaarTried);
+    // ── O VEREDITO NAO E' MEU ──────────────────────────────────────────────
+    //
+    // `r.bazaarWon` conta o que EU observei com `IsFeatPurchased`, e em
+    // 28/08/2026 esse numero deu 1098 de 1098 com nada liberado. Ele fica no
+    // log como dado, nunca como conclusao.
+    //
+    // Quem conclui e' o jogo: se ele continuou escrevendo "does not own the
+    // Entitlement" enquanto isto rodava, nao passou. Se parou, e' promissor —
+    // e nem isso e' prova, porque o jogo so' recusa quando alguem TENTA usar.
+    const int recusasDoJogo = RecusasDoJogoDesdeAMarca();
+
+    g_api->Log("[engrams]   Bazaar: %d de %d responderam sim ao IsFeatPurchased "
+               "(dado meu, nao veredito).", r.bazaarWon, r.bazaarTried);
+
+    if (recusasDoJogo < 0)
+        g_api->Log("[engrams]   Bazaar: NAO CONSEGUI ler o log do jogo. Sem ele "
+                   "nao ha' verificador independente, e o numero acima nao "
+                   "decide nada — isto NAO e' aprovacao.");
+    else if (recusasDoJogo > 0)
+        g_api->Log("[engrams]   Bazaar: REPROVADO pelo jogo — ele recusou "
+                   "entitlement %d vez(es) DURANTE esta tentativa. A chave "
+                   "ainda nao e' a que ele procura.", recusasDoJogo);
     else
-        g_api->Log("[engrams]   Bazaar: 0 of %d granted. The set is not keyed by "
-                   "template id either. Nothing was damaged finding that out, and "
-                   "the refusals below are unchanged.", r.bazaarTried);
+        g_api->Log("[engrams]   Bazaar: o jogo nao recusou nenhuma vez nesta "
+                   "janela. E' o melhor sinal que este plugin sabe dar de dentro "
+                   "— e ainda assim NAO e' prova: o jogo so' recusa quando "
+                   "alguem tenta usar. Confirme na tela.");
 }
 
 // ── proving the game reads OUR set, before granting anything ────────────────
