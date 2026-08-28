@@ -187,6 +187,12 @@ static const uint32_t CHAT_TEXT = 0x068;   // FString Message
 //
 // Read from config.json beside the plugin. Everything has a default that works,
 // so a server that never edits the file still gets a working command.
+// A tabela pode ser MENOR do que o header contra o qual este plugin foi
+// compilado — e' o caso previsto pelo `tamanho`, e o motivo de ele existir. Ler
+// `g_api->LerConjunto` numa API v7 le' 8 bytes DEPOIS do fim do struct: memoria
+// de outra coisa, interpretada como ponteiro de funcao. Decidido uma vez, no
+// carregar, enquanto o `tamanho` ainda esta' em maos.
+static bool g_temV8 = false;
 static std::string g_command    = "!engrams";
 static std::string g_permission = "";        // empty = anybody can use it
 
@@ -1722,6 +1728,50 @@ static void MeasureDlcGate(void* controller, void* character, int featId)
                        "the item was refused by the API's own guard.");
     }
 
+    // ── O POSITIVO DA LerConjunto, com resposta conhecida ───────────────────
+    //
+    // Esta conta possui `DLC_Turan` e `DLC_Nemedia` — os dois FName que deram o
+    // layout do FScriptSet em primeiro lugar. Ler o `m_OwnedDLCs` pela primitiva
+    // nova e reencontrar exatamente esses dois é o controle positivo que os
+    // negativos do arranque não conseguem dar: ele prova que a função LÊ, e não
+    // apenas que recusa.
+    //
+    // Se um dia a conta mudar de pacotes, este teste passa a comparar contra o
+    // que o `HasDLC` respondeu na tabela acima, e não contra dois nomes fixos —
+    // por isso o log imprime o que achou, e não só um "ok".
+    if (g_temV8)
+    {
+        const int32_t offSet = g_api->OffsetDoMembro(controller, "m_OwnedDLCs");
+        if (offSet >= 0)
+        {
+            SetElem lidos[32];
+            std::memset(lidos, 0, sizeof(lidos));
+            int quantos = 0;
+            const int ok = g_api->LerConjunto(
+                static_cast<const uint8_t*>(controller) + offSet,
+                uint32_t(sizeof(SetElem)), lidos, 32, &quantos);
+
+            if (ok && quantos > 0)
+            {
+                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs: %d elemento(s) —",
+                           quantos);
+                char nm[128];
+                for (int i = 0; i < quantos && i < 8; ++i)
+                {
+                    nm[0] = 0;
+                    g_api->NomeDeFName(int32_t(lidos[i].nomeIdx), nm, sizeof(nm));
+                    g_api->Log("[engrams]     [%d] \"%s\" (index %u, number %u)",
+                               i, nm[0] ? nm : "(?)",
+                               unsigned(lidos[i].nomeIdx), unsigned(lidos[i].nomeNum));
+                }
+            }
+            else
+                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs devolveu %d "
+                           "elemento(s) (ok=%d). Zero e' hipotese: ou o conjunto "
+                           "esta' vazio, ou a leitura recusou.", quantos, ok);
+        }
+    }
+
     // ── THE STRONGEST CANDIDATE FOR THE REWARD IDS ──────────────────────────
     //
     // `[vtable+0x4a0]` returns a TArray<FName> and takes only `this`. Exactly
@@ -2200,6 +2250,76 @@ static void ReadConfig()
                g_unlockBazaar ? "YES — Bazaar/Battle Pass handed out" : "no (Bazaar stays locked)");
 }
 
+// ── A BATERIA DA LerConjunto, PARAMETRIZADA PELA IMPLEMENTAÇÃO ──────────────
+//
+// Recebe a função em vez de chamar `g_api->LerConjunto` direto, e isso é o
+// ponto: sem isso não há como rodá-la contra uma implementação errada, e sem
+// rodá-la contra uma errada não se sabe se ela sabe reprovar.
+typedef int (*FnLerConjunto)(const void*, uint32_t, void*, int, int*);
+
+// O modo de falha mais provável de uma primitiva defensiva: recusar tudo. Passa
+// nos quatro negativos com nota máxima e não lê nada.
+static int LerConjuntoQuebrada(const void*, uint32_t, void*, int, int* fora)
+{
+    if (fora) *fora = 0;
+    return 0;
+}
+
+static bool CalibrarLerConjunto(FnLerConjunto f, const char* qual)
+{
+    if (!f) return false;
+
+    uint8_t lixo[64];
+    int n = -1;
+
+    const bool nulo = f(nullptr, 16, lixo, 4, &n) != 0;
+    const bool tam  = f(lixo, 7, lixo, 4, &n) != 0;                    // 7 nao e' 16 nem 32
+    const bool topo = f((const void*)0xFFFFFFFFFFFFFFFFull, 16, lixo, 4, &n) != 0;
+    const bool zero = f(lixo, 16, lixo, 0, &n) != 0;                   // maxElementos 0
+
+    // O positivo, com resposta conhecida POR CONSTRUÇÃO: um cabeçalho de
+    // FScriptSet apontando para três elementos que esta função acabou de
+    // escrever. Se voltarem três, e forem esses três, ela lê.
+    SetElem esperado[3];
+    std::memset(esperado, 0, sizeof(esperado));
+    esperado[0].nomeIdx = 0x11111111; esperado[0].nomeNum = 1;
+    esperado[1].nomeIdx = 0x22222222; esperado[1].nomeNum = 2;
+    esperado[2].nomeIdx = 0x33333333; esperado[2].nomeNum = 3;
+
+    uint8_t cab[0x50];
+    std::memset(cab, 0, sizeof(cab));
+    void* pd = esperado;
+    std::memcpy(cab + 0x00, &pd, sizeof(pd));       // ponteiro dos elementos
+    const int32_t tres = 3;
+    std::memcpy(cab + 0x08, &tres, sizeof(tres));   // ArrayNum
+    std::memcpy(cab + 0x0C, &tres, sizeof(tres));   // ArrayMax
+
+    SetElem volta[3];
+    std::memset(volta, 0, sizeof(volta));
+    int lidos = -1;
+    const bool fiel = f(cab, uint32_t(sizeof(SetElem)), volta, 3, &lidos) != 0
+                      && lidos == 3
+                      && std::memcmp(volta, esperado, sizeof(esperado)) == 0;
+
+    // E o corte: pedir menos do que existe copia o que cabe, não o que há.
+    SetElem corte[1];
+    std::memset(corte, 0, sizeof(corte));
+    int cortados = -1;
+    const bool cortou = f(cab, uint32_t(sizeof(SetElem)), corte, 1, &cortados) != 0
+                        && cortados == 1
+                        && corte[0].nomeIdx == esperado[0].nomeIdx;
+
+    const bool ok = !nulo && !tam && !topo && !zero && fiel && cortou;
+    g_api->Log("[engrams]   %-9s nulo=%s tam-invalido=%s topo=%s max-zero=%s "
+               "· le-3-de-3=%s corta-em-1=%s -> %s",
+               qual,
+               nulo ? "PASSOU" : "recusou", tam  ? "PASSOU" : "recusou",
+               topo ? "PASSOU" : "recusou", zero ? "PASSOU" : "recusou",
+               fiel   ? "sim" : "NAO", cortou ? "sim" : "NAO",
+               ok ? "passou na bateria" : "reprovada");
+    return ok;
+}
+
 extern "C" __declspec(dllexport)
 void ConanPluginCarregar(const ConanApiTabela* api)
 {
@@ -2358,11 +2478,44 @@ void ConanPluginCarregar(const ConanApiTabela* api)
                    topo  ? "PASSOU(DEFEITO)" : "recusou",
                    naoVt ? "PASSOU(DEFEITO)" : "recusou",
                    ok ? "CALIBRADA 5/5 nos negativos"
-                      : "REPROVADA — a primitiva aceita o que devia recusar");
+                      : "REPROVADA — ou aceita o que devia recusar, ou nao le' o que devia ler");
     }
     else
         g_api->Log("[engrams] ChamarVirtual ausente: a API deste servidor e' anterior "
                    "a v7. O caminho do pacote vazio nao roda; o resto roda.");
+
+    // O `tamanho` é o que separa "a tabela tem o campo" de "leio 8 bytes depois
+    // do fim do struct". Decidido UMA vez, aqui, enquanto ele está em mãos.
+    g_temV8 = (g_api->tamanho >= sizeof(ConanApiTabela)) && (g_api->LerConjunto != nullptr);
+
+    // ── CALIBRAÇÃO DA LerConjunto (v8) — E DA PRÓPRIA CALIBRAÇÃO ────────────
+    //
+    // Quatro recusas provam que a primitiva diz não. Não provam que ela LÊ. Uma
+    // implementação que devolvesse 0 sempre passaria nos quatro com nota máxima
+    // — que é, letra por letra, como uma guarda desta casa passou verde tendo
+    // conferido zero arquivos.
+    //
+    // Então a bateria roda DUAS vezes: contra a primitiva de verdade, e contra
+    // uma sabidamente quebrada. Se a quebrada também passar, quem está com
+    // defeito é o teste, e o log diz isso em vez de anunciar aprovação.
+    if (g_temV8)
+    {
+        g_api->Log("[engrams] LerConjunto — a bateria roda 2x: na primitiva, e "
+                   "numa quebrada de proposito (que TEM de reprovar)");
+        const bool real  = CalibrarLerConjunto(g_api->LerConjunto, "primitiva");
+        const bool falsa = CalibrarLerConjunto(LerConjuntoQuebrada, "quebrada");
+
+        if (real && !falsa)
+            g_api->Log("[engrams] LerConjunto: CALIBRADA — aprovou a certa e "
+                       "reprovou a quebrada");
+        else if (falsa)
+            g_api->Log("[engrams] LerConjunto: TESTE INVALIDO — a bateria "
+                       "aprovou uma implementacao que devolve zero sempre. "
+                       "Nao confie no resultado da primitiva.");
+        else
+            g_api->Log("[engrams] LerConjunto: REPROVADA — a primitiva nao "
+                       "passou na propria bateria");
+    }
 
     g_api->Log("[engrams] ready. Type %s in the game chat.", g_command.c_str());
 }
