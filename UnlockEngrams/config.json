@@ -55,7 +55,7 @@
   "unlock_dlc":    false,
   "unlock_bazaar": false,
 
-  "msg_ok":      "Unlocked {n} knowledges. You can build anything now.",
+  "msg_ok":      "Unlocked {n} knowledges. Still locked by DLC: {dlc}.",
   "msg_denied":  "You are not allowed to use this command.",
   "msg_partial": "Unlocked {n} knowledges, but not all of it. If something still won't build, tell an admin: the reason is in ConanApi.log.",
   "msg_failed":  "I could not unlock the knowledge. Tell an admin: the reason is in ConanApi.log."

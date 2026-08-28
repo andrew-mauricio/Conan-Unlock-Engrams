@@ -1144,6 +1144,56 @@ static bool LendOwnedSet(Loan& L, void* pc, const char* const* pkgs, int n)
     return true;
 }
 
+// ── THE SHORTEST PATH: an empty package is allowed, full stop ───────────────
+//
+// Disassembled from HasDlcOrEntitlementForFeat (0x144E185F0):
+//
+//     call [vtable+0x498]   FeatItem->GetDLCPackage() -> FName
+//     test rax, rax
+//     je   0x144E186C6      -> mov al,1 ; ret     EMPTY MEANS ALLOWED
+//
+// No ownership set is consulted, and the branch that reaches the reward set is
+// never taken. So blanking the package covers Bazaar content too — without ever
+// needing the reward ids, which live in a global TMap this plugin cannot read.
+//
+// AND THE PACKAGE COMES FROM THE TABLE ROW, not from the item (0x4DE1C70):
+//
+//     call [vtable+0x500]   -> the FeatTableRow
+//     call 0x144E13610      -> its type    (reads byte [row+8])
+//     cmp  al, 4            -> confirms FeatTableRow
+//     mov  rax, [rdi+0xE0]  -> +0xE0 = DLCPackage, matching golden/structs.json
+//
+// `[vtable+0x500]` is a native virtual — invisible to reflection, and reaching
+// it by hand is what killed the server on 27/08. It is reachable now because
+// the API grew `ChamarVirtual` (v7), which does that one dangerous thing once,
+// centrally, behind five checks — including the one that was missing that day:
+// the slot must point at EXECUTABLE memory.
+//
+// THE ROW IS SHARED. It belongs to the DataTable, not to a player, so blanking
+// it changes the answer for EVERYONE while it is blank. That is why the window
+// is one feat wide: blank, grant, restore, next. Never the whole loop.
+static const uint32_t VT_GET_ROW  = 0x500 / 8;   // FeatItem -> FeatTableRow
+static const uint32_t ROW_DLCPKG  = 0xE0;        // FeatTableRow.DLCPackage
+static const uint32_t ROW_TIPO    = 0x08;        // byte the game checks == 4
+static const uint8_t  ROW_TIPO_FEAT = 4;
+
+// Returns the row only when the game's own type check agrees it is a
+// FeatTableRow. Anything else and we are looking at a different struct, where
+// +0xE0 means something else entirely.
+static void* LinhaDoFeat(void* item)
+{
+    if (!item || !g_api || !g_api->ChamarVirtual) return nullptr;
+
+    void* linha = nullptr;
+    if (!g_api->ChamarVirtual(item, VT_GET_ROW, nullptr, &linha) || !linha)
+        return nullptr;
+
+    uint8_t tipo = 0;
+    if (g_api->LerMembro(linha, ROW_TIPO, &tipo, 1) <= 0) return nullptr;
+    if (tipo != ROW_TIPO_FEAT) return nullptr;
+    return linha;
+}
+
 // ── the Bazaar leg: trying the refused feats BY ID ──────────────────────────
 //
 // WHAT IS ALREADY KNOWN, measured, not assumed:
@@ -1217,6 +1267,80 @@ static void TryBazaarByRewardIds(void* controller, void* prog, Result& r)
                 }
             }
         }   // <- this batch is back before the next one goes out
+    }
+
+    // ── SEGUNDA VOLTA: pelo PACOTE VAZIO, um feat de cada vez ───────────────
+    //
+    // Se emprestar os ids nao funcionou (e nao funcionou: 0 de 1098, medido),
+    // resta o atalho que o desmonte mostrou — pacote vazio LIBERA, sem consultar
+    // conjunto nenhum. Isso cobre Bazaar e DLC juntos, porque o desvio para o
+    // conjunto de recompensas nunca chega a ser tomado.
+    //
+    // UM FEAT DE CADA VEZ, e a janela fecha antes do proximo. A linha pertence a`
+    // DataTable, nao ao jogador: enquanto o pacote esta' em branco, a resposta
+    // muda para TODO MUNDO no servidor. Uma janela por feat mede em microssegundos;
+    // uma janela pelo laco inteiro mediria segundos, com outros jogadores dentro.
+    if (r.bazaarWon == 0 && g_api->ChamarVirtual)
+    {
+        void* spawner = g_api->GetDefaultObject("GameItemSpawner");
+        int limpos = 0, ganhos = 0, semLinha = 0;
+
+        for (size_t i = 0; i < r.refusedIds.size(); ++i)
+        {
+            const int32_t id = int32_t(r.refusedIds[i]);
+
+            void* item = ConanApi::Call<void*>(spawner, "SpawnFeatItem", controller, id);
+            if (g_api->UltimaChamadaExecutou() == 0 || !item) continue;
+
+            void* linha = LinhaDoFeat(item);
+            if (!linha) { ++semLinha; continue; }
+
+            uint8_t pacote[8];
+            if (g_api->LerMembro(linha, ROW_DLCPKG, pacote, 8) <= 0) continue;
+
+            const uint8_t zero[8] = {0,0,0,0,0,0,0,0};
+            if (g_api->EscreverMembro(linha, ROW_DLCPKG, zero, 8) <= 0) continue;
+            ++limpos;
+
+            // A DEVOLUCAO POR DESTRUTOR, e nao por uma linha no fim do bloco.
+            //
+            // Entre zerar e devolver ha' DUAS chamadas ao jogo. Uma linha de
+            // restauro no fim so' cobre os caminhos que alguem lembrou de
+            // prever; o destrutor cobre tambem o que ninguem previu. E aqui o
+            // custo de errar nao e' um jogador: a linha pertence a` DataTable,
+            // entao um pacote deixado em branco muda a resposta do jogo para
+            // TODO MUNDO, pelo resto da sessao.
+            //
+            // Mesma licao que o LentSetGuard aprendeu na revisao adversarial,
+            // aplicada antes de alguem precisar apontar.
+            struct Devolver
+            {
+                void* linha; const uint8_t* original; int id;
+                ~Devolver()
+                {
+                    if (g_api->EscreverMembro(linha, ROW_DLCPKG, original, 8) <= 0)
+                        g_api->Log("[engrams]   !! NAO devolvi o DLCPackage do feat "
+                                   "%d — a linha da tabela ficou EM BRANCO para todos. "
+                                   "Reinicie o servidor.", id);
+                }
+            } devolucao{linha, pacote, int(id)};
+
+            ConanApi::Call<void>(prog, "ServerForceLearnFeat",
+                                 id, bool(false), bool(true), bool(false));
+            const bool tem = ConanApi::Call<bool>(prog, "IsFeatPurchased", id)
+                             && g_api->UltimaChamadaExecutou() != 0;
+
+            if (tem) { ++ganhos; ++r.learned; --r.refused; }
+        }
+
+        if (limpos > 0)
+            g_api->Log("[engrams]   Bazaar (pacote vazio): %d linha(s) tratadas, "
+                       "%d feat(s) concedidos, %d sem linha.", limpos, ganhos, semLinha);
+        else
+            g_api->Log("[engrams]   Bazaar (pacote vazio): nenhuma linha alcancada "
+                       "(%d sem linha). ChamarVirtual respondeu? A API precisa ser v7.",
+                       semLinha);
+        r.bazaarWon += ganhos;
     }
 
     if (r.bazaarWon > 0)
@@ -2202,6 +2326,43 @@ void ConanPluginCarregar(const ConanApiTabela* api)
                       : "REPROVADA — ou a API deste servidor ainda tem o furo de "
                         "22:50, ou a correcao cegou a guarda");
     }
+
+    // ── CALIBRAÇÃO DA ChamarVirtual (v7) ────────────────────────────────────
+    //
+    // Cinco casos de resposta conhecida. Sem os negativos, "funcionou" e "aceita
+    // qualquer coisa" são indistinguíveis — e esta primitiva existe justamente
+    // porque aceitar qualquer coisa matou o servidor em 27/08.
+    //
+    // O positivo usa a tabela da própria API como objeto: ela NÃO é UObject e
+    // não tem vtable de verdade, então serve como negativo de "objeto errado".
+    // O positivo de verdade só existe com um objeto do jogo em mãos, e ele é
+    // medido no comando, não aqui.
+    if (g_api->tamanho >= sizeof(ConanApiTabela) && g_api->ChamarVirtual)
+    {
+        void* r = nullptr;
+        const bool nulo   = g_api->ChamarVirtual(nullptr, 0, nullptr, &r) != 0;
+        const bool baixo  = g_api->ChamarVirtual((void*)0x100, 0, nullptr, &r) != 0;
+        const bool alto   = g_api->ChamarVirtual((void*)g_api, 99999, nullptr, &r) != 0;
+        const bool topo   = g_api->ChamarVirtual((void*)0xFFFFFFFFFFFFFFFFull, 1, nullptr, &r) != 0;
+        // a tabela da API é memória legível cujo primeiro qword é um ponteiro de
+        // função — mas para DADOS, não para uma vtable. O slot 0 dela não aponta
+        // para código executável, então tem de ser recusado.
+        const bool naoVt  = g_api->ChamarVirtual((void*)g_api, 300, nullptr, &r) != 0;
+
+        const bool ok = (!nulo && !baixo && !alto && !topo && !naoVt);
+        g_api->Log("[engrams] ChamarVirtual: nulo=%s pagina-baixa=%s indice-alto=%s "
+                   "topo=%s nao-vtable=%s -> %s",
+                   nulo  ? "PASSOU(DEFEITO)" : "recusou",
+                   baixo ? "PASSOU(DEFEITO)" : "recusou",
+                   alto  ? "PASSOU(DEFEITO)" : "recusou",
+                   topo  ? "PASSOU(DEFEITO)" : "recusou",
+                   naoVt ? "PASSOU(DEFEITO)" : "recusou",
+                   ok ? "CALIBRADA 5/5 nos negativos"
+                      : "REPROVADA — a primitiva aceita o que devia recusar");
+    }
+    else
+        g_api->Log("[engrams] ChamarVirtual ausente: a API deste servidor e' anterior "
+                   "a v7. O caminho do pacote vazio nao roda; o resto roda.");
 
     g_api->Log("[engrams] ready. Type %s in the game chat.", g_command.c_str());
 }

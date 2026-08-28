@@ -153,12 +153,20 @@ gets a working command.
   "command":    "!engrams",
   "permission": "",
 
-  "msg_ok":      "Unlocked {n} knowledges. You can build anything now. Another {dlc} belong to DLC your account doesn't own.",
+  "unlock_dlc":    false,
+  "unlock_bazaar": false,
+
+  "msg_ok":      "Unlocked {n} knowledges. Still locked by DLC: {dlc}.",
   "msg_denied":  "You are not allowed to use this command.",
   "msg_partial": "Unlocked {n} knowledges, but not all of it. If something still won't build, tell an admin: the reason is in ConanApi.log.",
   "msg_failed":  "I could not unlock the knowledge. Tell an admin: the reason is in ConanApi.log."
 }
 ```
+
+> **`{dlc}` stays in the message even when it is zero, and that is deliberate.**
+> "Still locked by DLC: 0" is the confirmation that it really was everything.
+> Dropping the number when it happens to be 1332 would tell half the truth to
+> somebody who is looking straight at a padlock.
 
 | placeholder | becomes |
 |---|---|
@@ -286,12 +294,39 @@ That is why `{dlc}` exists in the messages. It isn't an apology — it's the oth
 half of the truth. A player who owns Siptah gets the Siptah feats; one who
 doesn't, doesn't.
 
+### Stepping over it — two switches, both off by default
+
+Since **2.9.0** the plugin can step over that check, and it stays off unless you
+write it down. Two keys in `config.json`, separate on purpose:
+
+| Key | Default | Covers |
+|---|---|---|
+| `unlock_dlc` | `false` | The expansion packs — Siptah, Aquilonia, Yamatai, Pict, Khitai, Riders, BAS, Argos, RPpack, Riddle, EARhino |
+| `unlock_bazaar` | `false` | Bazaar and Battle Pass content (`DLC_Special`, `DLC_Entitlement`) |
+
+Handing out an expansion someone could have bought once is one decision; handing
+out seasonal store content bought with real currency is another. Bundling them
+into a single key would take that choice away by hiding it. The log prints how
+each one is set on every start, so a typo shows up there instead of in a player
+asking why nothing changed.
+
+Measured on a live server with `unlock_dlc` on: refusals fell from **1332 to
+1098**, and the twelve expansion packages gave way completely.
+
 > [!IMPORTANT]
-> **This plugin will not bypass DLC entitlements.**
-> `ConanCheatManager::SetBypassEntitlements` exists on this build and would step
-> over that check. DLC is content Funcom sells. Handing it out for free is not a
-> feature, and nobody should end up doing it by accident because they installed
-> a plugin that unlocks building knowledge.
+> **Setting a flag is not unlocking anything.**
+> After every use the plugin compares the refusal count and says whether the lock
+> *actually* gave way — and when it did not, it asks the game itself why, about a
+> feat that was really refused. A log line announcing success before anything was
+> checked is how a plugin lies to a player with total confidence, and this
+> reporting exists because exactly that happened here.
+
+> [!CAUTION]
+> **Whether this belongs on your server is your call.**
+> DLC is content Funcom sells, and Bazaar content is bought with real currency.
+> The plugin ships neutral, with both switches off, and will not hand anything
+> out because somebody installed it without reading. Turning either one on is a
+> decision that has to be written into a file to happen.
 
 ### And the knowledge window isn't the whole picture
 
