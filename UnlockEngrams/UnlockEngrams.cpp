@@ -1482,6 +1482,63 @@ static void DumpOwnedSet(void* controller)
     // ArrayNum, HashSize and the rest are all in those 80 bytes, in plain sight.
 }
 
+// ── O POSITIVO DA LerConjunto, CONTRA DADO VIVO ─────────────────────────────
+//
+// Isto morava dentro do MeasureDlcGate, que so' e' chamado quando sobra feat
+// recusado. Em 28/08/2026 o desbloqueio funcionou por inteiro — zero recusas — e
+// a medicao nunca rodou. Um diagnostico que so' fala quando da' errado nao
+// confirma nada quando da' certo, e "nao apareceu no log" ficou
+// indistinguivel de "nao foi medido".
+//
+// Agora roda sempre, cedo, antes de qualquer emprestimo de conjunto: o que ela
+// le' e' o estado REAL da conta, nao o nosso.
+static void ProvarLerConjunto(void* controller)
+{
+    if (!g_temV8 || !controller) return;
+    // ── O POSITIVO DA LerConjunto, com resposta conhecida ───────────────────
+    //
+    // Esta conta possui `DLC_Turan` e `DLC_Nemedia` — os dois FName que deram o
+    // layout do FScriptSet em primeiro lugar. Ler o `m_OwnedDLCs` pela primitiva
+    // nova e reencontrar exatamente esses dois é o controle positivo que os
+    // negativos do arranque não conseguem dar: ele prova que a função LÊ, e não
+    // apenas que recusa.
+    //
+    // Se um dia a conta mudar de pacotes, este teste passa a comparar contra o
+    // que o `HasDLC` respondeu na tabela acima, e não contra dois nomes fixos —
+    // por isso o log imprime o que achou, e não só um "ok".
+    {
+        const int32_t offSet = g_api->OffsetDoMembro(controller, "m_OwnedDLCs");
+        if (offSet >= 0)
+        {
+            SetElem lidos[32];
+            std::memset(lidos, 0, sizeof(lidos));
+            int quantos = 0;
+            const int ok = g_api->LerConjunto(
+                static_cast<const uint8_t*>(controller) + offSet,
+                uint32_t(sizeof(SetElem)), lidos, 32, &quantos);
+
+            if (ok && quantos > 0)
+            {
+                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs: %d elemento(s) —",
+                           quantos);
+                char nm[128];
+                for (int i = 0; i < quantos && i < 8; ++i)
+                {
+                    nm[0] = 0;
+                    g_api->NomeDeFName(int32_t(lidos[i].nomeIdx), nm, sizeof(nm));
+                    g_api->Log("[engrams]     [%d] \"%s\" (index %u, number %u)",
+                               i, nm[0] ? nm : "(?)",
+                               unsigned(lidos[i].nomeIdx), unsigned(lidos[i].nomeNum));
+                }
+            }
+            else
+                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs devolveu %d "
+                           "elemento(s) (ok=%d). Zero e' hipotese: ou o conjunto "
+                           "esta' vazio, ou a leitura recusou.", quantos, ok);
+        }
+    }
+}
+
 static void MeasureDlcGate(void* controller, void* character, int featId)
 {
     if (!controller || !character || !g_api) return;
@@ -1728,50 +1785,6 @@ static void MeasureDlcGate(void* controller, void* character, int featId)
                        "the item was refused by the API's own guard.");
     }
 
-    // ── O POSITIVO DA LerConjunto, com resposta conhecida ───────────────────
-    //
-    // Esta conta possui `DLC_Turan` e `DLC_Nemedia` — os dois FName que deram o
-    // layout do FScriptSet em primeiro lugar. Ler o `m_OwnedDLCs` pela primitiva
-    // nova e reencontrar exatamente esses dois é o controle positivo que os
-    // negativos do arranque não conseguem dar: ele prova que a função LÊ, e não
-    // apenas que recusa.
-    //
-    // Se um dia a conta mudar de pacotes, este teste passa a comparar contra o
-    // que o `HasDLC` respondeu na tabela acima, e não contra dois nomes fixos —
-    // por isso o log imprime o que achou, e não só um "ok".
-    if (g_temV8)
-    {
-        const int32_t offSet = g_api->OffsetDoMembro(controller, "m_OwnedDLCs");
-        if (offSet >= 0)
-        {
-            SetElem lidos[32];
-            std::memset(lidos, 0, sizeof(lidos));
-            int quantos = 0;
-            const int ok = g_api->LerConjunto(
-                static_cast<const uint8_t*>(controller) + offSet,
-                uint32_t(sizeof(SetElem)), lidos, 32, &quantos);
-
-            if (ok && quantos > 0)
-            {
-                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs: %d elemento(s) —",
-                           quantos);
-                char nm[128];
-                for (int i = 0; i < quantos && i < 8; ++i)
-                {
-                    nm[0] = 0;
-                    g_api->NomeDeFName(int32_t(lidos[i].nomeIdx), nm, sizeof(nm));
-                    g_api->Log("[engrams]     [%d] \"%s\" (index %u, number %u)",
-                               i, nm[0] ? nm : "(?)",
-                               unsigned(lidos[i].nomeIdx), unsigned(lidos[i].nomeNum));
-                }
-            }
-            else
-                g_api->Log("[engrams]   LerConjunto no m_OwnedDLCs devolveu %d "
-                           "elemento(s) (ok=%d). Zero e' hipotese: ou o conjunto "
-                           "esta' vazio, ou a leitura recusou.", quantos, ok);
-        }
-    }
-
     // ── THE STRONGEST CANDIDATE FOR THE REWARD IDS ──────────────────────────
     //
     // `[vtable+0x4a0]` returns a TArray<FName> and takes only `this`. Exactly
@@ -1926,6 +1939,11 @@ static Result UnlockEverything(void* controller)
         // flag was measured useless twice; gating the one mechanism that might
         // work behind the one that provably does not was a leftover.
         {
+            // ANTES do emprestimo, sempre: le' o conjunto REAL da conta. Depois
+            // da janela abrir, o que esta' la' e' NOSSO, e ler isso nao provaria
+            // nada sobre a primitiva.
+            ProvarLerConjunto(controller);
+
             Window janela(&g_grantingFor,
                           (g_unlockDlc || g_unlockBazaar) ? pawn : nullptr);
             LentSetGuard emprestimo(&g_loanDlc, &g_loanBazaar);
