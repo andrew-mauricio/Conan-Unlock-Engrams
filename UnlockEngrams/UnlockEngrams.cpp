@@ -170,6 +170,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 // The table the loader hands over. Everything this plugin knows how to do with
 // the game goes through it; nothing of the runtime is linked in here.
@@ -1325,6 +1326,405 @@ static int RecusasDoJogoDesdeAMarca()
     return n;
 }
 
+
+// ── OS IDS QUE O JOGO PEDE, LIDOS DO JOGO ───────────────────────────────────
+//
+// A primeira tentativa usou os ids da FeatTable — os feats que este plugin
+// viu recusados. O jogo queria outros: ele recusa por id de RECEITA, e a
+// medicao de 29/08/2026 mostrou que 1.500 dos 1.909 que ele cita sao ID DE
+// ITEM da ItemTable (1.495 deles marcados DLC_Special). Espacos diferentes.
+//
+// Em vez de adivinhar de qual tabela tirar, pergunta-se ao proprio jogo: ele
+// escreve o id exato em cada recusa,
+//
+//     Character does not own the Entitlement 1-269 for recipe 269
+//
+// e essas linhas sao geradas AGORA, pela tentativa que acabou de rodar. Ler
+// dali e' a unica fonte que nao depende de eu ter escolhido a tabela certa.
+//
+// LIMITE: se o log nao puder ser lido, isto devolve vazio — e vazio faz a
+// segunda passada nao acontecer, em vez de rodar sobre um palpite.
+static std::vector<int> IdsQueOJogoPediuDesdeAMarca()
+{
+    std::vector<int> ids;
+    if (g_logMarca < 0) return ids;
+    const char* c = CaminhoLogDoJogo();
+    if (!c) return ids;
+
+    FILE* f = nullptr;
+    ENG_FOPEN(f, c, "rb");
+    if (!f) return ids;
+
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return ids; }
+    const long long fim = std::ftell(f);
+    if (fim < g_logMarca) { std::fclose(f); return ids; }   // rotacionou
+    if (std::fseek(f, long(g_logMarca), SEEK_SET) != 0) { std::fclose(f); return ids; }
+
+    // Um teto para nao crescer sem limite se o log estiver enorme. 8192 e' bem
+    // acima dos 1.909 medidos e bem abaixo de qualquer coisa preocupante.
+    const size_t TETO = 8192;
+    char linha[2048];
+    while (std::fgets(linha, int(sizeof(linha)), f) && ids.size() < TETO)
+    {
+        const char* p = std::strstr(linha, "for recipe ");
+        if (!p) continue;
+        p += 11;                                   // strlen("for recipe ")
+        int id = 0;
+        if (std::sscanf(p, "%d", &id) == 1 && id > 0)
+            ids.push_back(id);
+    }
+    std::fclose(f);
+
+    // O jogo repete o mesmo id muitas vezes; um TSet nao precisa de repeticao.
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+
+// Empresta os ids dados como "tipo-id" e reconcede, em lotes. Devolve quantos
+// o `IsFeatPurchased` passou a aceitar — DADO, nao veredito: quem julga e' a
+// contagem de recusas do jogo, medida por fora.
+static int EmprestarEReconceder(void* controller, void* prog,
+                                const std::vector<int>& ids, int tipo,
+                                const char* rotulo)
+{
+    if (!controller || !prog || ids.empty()) return 0;
+    int ganhos = 0;
+
+    for (size_t base = 0; base < ids.size(); base += LOAN_LOTE)
+    {
+        const int n = int((ids.size() - base < size_t(LOAN_LOTE))
+                          ? (ids.size() - base) : size_t(LOAN_LOTE));
+
+        std::vector<std::string> textos((size_t)n);
+        std::vector<const char*> nomes((size_t)n);
+        char buf[32];
+        for (int i = 0; i < n; ++i)
+        {
+            std::snprintf(buf, sizeof(buf), "%d-%d", tipo, ids[base + size_t(i)]);
+            textos[(size_t)i] = buf;
+            nomes[(size_t)i]  = textos[(size_t)i].c_str();
+        }
+
+        if (!LendOwnedSet(g_loanBazaar, controller, nomes.data(), n))
+        {
+            g_api->Log("[engrams]   %s: lote em %d nao foi emprestado — paro aqui "
+                       "em vez de seguir as cegas.", rotulo, int(base));
+            return ganhos;
+        }
+        {
+            LentSetGuard guard(&g_loanBazaar);
+            for (int i = 0; i < n; ++i)
+            {
+                const int32_t id = int32_t(ids[base + size_t(i)]);
+                ConanApi::Call<void>(prog, "ServerForceLearnFeat",
+                                     id, bool(false), bool(true), bool(false));
+                if (ConanApi::Call<bool>(prog, "IsFeatPurchased", id)
+                    && g_api->UltimaChamadaExecutou() != 0)
+                    ++ganhos;
+            }
+        }
+    }
+    return ganhos;
+}
+
+
+
+// ── MONTAR UM TSet<FName> DE 80 BYTES, PARA PASSAR COMO PARAMETRO ───────────
+//
+// O `LendOwnedSet` monta este mesmo cabecalho para ESCREVER num membro do
+// objeto. Aqui o destino e' um bloco nosso, porque `LearnOwnedDLCRecipes` o
+// recebe como PARAMETRO — e como `entrada_saida`, ou seja, a funcao pode mexer
+// nele. Por isso a memoria e' nossa e gravavel, nunca um ponteiro para dentro
+// do jogo.
+//
+// O layout nao foi deduzido: veio de exemplar vivo, e esta' comentado campo a
+// campo no LendOwnedSet. Aqui so' e' reusado.
+static bool MontarTSetDeNomes(uint8_t cab[80], SetElem* elems, int capacidade,
+                              const char* const* nomes, int n)
+{
+    if (!cab || !elems || n <= 0 || n > capacidade) return false;
+
+    int live = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        ConanApi::Nome nm(nomes[i]);
+        if (!nm.valido) continue;
+        elems[live].nomeIdx   = *(const uint32_t*)(nm.bruto);
+        elems[live].nomeNum   = *(const uint32_t*)(nm.bruto + 4);
+        elems[live].hashIndex = 0;
+        ++live;
+    }
+    if (live <= 0) return false;
+    for (int i = 0; i < live; ++i) elems[i].hashNext = (i == 0) ? -1 : (i - 1);
+
+    std::memset(cab, 0, 80);
+    *(void**)   (cab + 0x00) = elems;
+    *(int32_t*) (cab + 0x08) = live;
+    *(int32_t*) (cab + 0x0C) = capacidade;     // Max > Num: folga proposital
+    for (int w = 0; w < 4; ++w)
+    {
+        uint32_t mask = 0;
+        for (int b = 0; b < 32; ++b)
+            if (w * 32 + b < live) mask |= (1u << b);
+        *(uint32_t*)(cab + 0x10 + w * 4) = mask;
+    }
+    *(void**)   (cab + 0x20) = nullptr;
+    *(int32_t*) (cab + 0x28) = live;
+    *(int32_t*) (cab + 0x2C) = 128;
+    *(int32_t*) (cab + 0x30) = -1;
+    *(int32_t*) (cab + 0x34) = 0;
+    *(uint32_t*)(cab + 0x38) = uint32_t(live - 1);
+    *(void**)   (cab + 0x40) = nullptr;
+    *(int32_t*) (cab + 0x48) = 1;
+    return true;
+}
+
+// ── A PORTA QUE O PROPRIO JOGO USA — E ELA TAMBEM APAGA ─────────────────────
+//
+// `RecipeManager::LearnOwnedDLCRecipes(TSet<FName> ownedDLCs)` e' a rotina que o
+// jogo roda quando a posse de DLC muda. Nao e' enganar uma consulta: e' chamar
+// o caminho de dentro.
+//
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │  PERIGO, e nao e' teorico: ela APAGA o que nao esta' no conjunto.        │
+// └──────────────────────────────────────────────────────────────────────────┘
+//
+// A implementacao (vtable+0x630 do RecipeManager, RVA 0x4E4D9F0, 2414 bytes,
+// lida por desmontagem em 29/08/2026) faz, em resumo:
+//
+//     mapa  = copia de GetDefault<UGameItemSpawner>()->TMap em +0xC8
+//     todos = uniao de TODOS os valores do mapa      // toda receita de DLC
+//     para cada dlc em ownedDLCs:
+//         para cada receita desse dlc:
+//             se o jogador nao tem -> cria o RecipeItem e poe no inventario
+//             todos.Remove(receita)
+//     para cada receita que sobrou em `todos`:       // os DLCs que NAO vieram
+//         DeleteItemsByTemplate(...)                 // <<< APAGA
+//
+// A primeira versao deste codigo passava apenas { "DLC_Special",
+// "DLC_Entitlement" }. Isso teria mandado o jogo APAGAR as receitas de TODOS os
+// outros pacotes — inclusive `DLC_Turan` e `DLC_Nemedia`, que esta conta possui
+// DE VERDADE, comprados com dinheiro.
+//
+// O codigo chegou a ser instalado. Nao chegou a rodar: o ultimo comando foi
+// 21:20 e a instalacao 21:26, e ninguem entrou no meio. Foi sorte, nao
+// competencia — e e' exatamente por isso que se le' a implementacao ANTES de
+// chamar, e nao depois.
+//
+// Por isso o conjunto passa a ser a lista INTEIRA que este plugin conhece
+// (DLC_PACKAGES), que ja' inclui os pacotes realmente possuidos. Com todos
+// dentro, o laco de exclusao nao encontra nada para apagar.
+//
+// LIMITE ADMITIDO: uma lista escrita a' mao envelhece calada, e esta base ja'
+// pagou por isso tres vezes. O certo e' enumerar as chaves do TMap do
+// GameItemSpawner em runtime; enquanto isso nao existe, a lista fixa e' usada e
+// o risco fica DECLARADO aqui em vez de escondido.
+static void ChamarLearnOwnedDLCRecipes(void* alvo, const char* rotulo)
+{
+    if (!alvo || !g_api) return;
+
+    // A lista COMPLETA, nao so' os dois do Bazar. Ver o bloco acima.
+    SetElem elems[N_DLC_PACKAGES + 4];
+    std::memset(elems, 0, sizeof(elems));
+    uint8_t cab[80];
+
+    if (!MontarTSetDeNomes(cab, elems, int(sizeof(elems) / sizeof(elems[0])),
+                           DLC_PACKAGES, N_DLC_PACKAGES))
+    {
+        g_api->Log("[engrams]   diag: nao consegui montar o TSet — nao chamo "
+                   "LearnOwnedDLCRecipes com lixo.");
+        return;
+    }
+
+    g_api->Log("[engrams]   diag: LearnOwnedDLCRecipes com os %d pacotes "
+               "conhecidos (a lista TEM de ser completa: o que ficar de fora, o "
+               "jogo APAGA).", N_DLC_PACKAGES);
+
+    ConanApi::Call<void>(alvo, "LearnOwnedDLCRecipes", cab);
+    g_api->Log("[engrams]   diag: LearnOwnedDLCRecipes em %s — executou=%s.",
+               rotulo, g_api->UltimaChamadaExecutou() ? "sim" : "NAO");
+}
+
+
+// ── QUAL RECEITA FABRICA O ITEM ─────────────────────────────────────────────
+//
+// `GameItemSpawner::GetRecipesThatCraftTemplate(mundo, TemplateId)` devolve os
+// ids de RECEITA que produzem um item. Sem isto, o "1-<receita>" que este
+// plugin escrevia era chute: eu tinha o id do ITEM (9156) e usava como se fosse
+// o da receita, que sao numeracoes diferentes.
+//
+// Le' pelo caminho de lista da API (CONAN_SAIDA_LISTA), que copia os ELEMENTOS
+// — nunca o cabecalho do TArray, que ProcessEvent destroi ao retornar.
+static void QualReceitaFabrica(void* controller, int32_t templateId)
+{
+    if (!controller || !g_api) return;
+
+    int32_t ids[32];
+    std::memset(ids, 0, sizeof(ids));
+
+    ConanSaida saida;
+    std::memset(&saida, 0, sizeof(saida));
+    saida.indice     = 2;                       // ReturnValue, off 16
+    saida.destino    = ids;
+    saida.tipo       = CONAN_SAIDA_LISTA;
+    saida.capacidade = 32;
+
+    // Os argumentos vao um a um, com o tamanho de cada: a API monta o bloco de
+    // parametros ela mesma, a partir da reflexao. Montar o bloco a mao aqui
+    // seria repetir por fora um trabalho que ela ja' faz por dentro — e errar
+    // um byte de padding corrompe a pilha da thread do jogo.
+    void*   mundo = controller;
+    int32_t id    = templateId;
+    const void* args[] = { &mundo, &id };
+    const uint32_t tams[] = { uint32_t(sizeof(mundo)), uint32_t(sizeof(id)) };
+
+    const int n = g_api->ChamarFuncaoEx(controller, "GetRecipesThatCraftTemplate",
+                                        args, tams, 2, &saida, 1, nullptr, 0);
+
+    if (g_api->UltimaChamadaExecutou() == 0)
+    {
+        g_api->Log("[engrams]   diag: GetRecipesThatCraftTemplate nao executou — "
+                   "nao sei qual receita fabrica o item %d.", int(templateId));
+        return;
+    }
+    if (n <= 0)
+    {
+        g_api->Log("[engrams]   diag: o jogo nao aponta receita nenhuma para o "
+                   "item %d. Zero e' resposta, mas tambem pode ser a lista nao "
+                   "ter cabido em 32.", int(templateId));
+        return;
+    }
+
+    char buf[280]; buf[0] = 0;
+    for (int i = 0; i < n && i < 10; ++i)
+    {
+        char um[24];
+        std::snprintf(um, sizeof(um), "%s%d", i ? ", " : "", int(ids[i]));
+        std::strncat(buf, um, sizeof(buf) - std::strlen(buf) - 1);
+    }
+    g_api->Log("[engrams]   diag: o item %d e' fabricado pela(s) receita(s): %s "
+               "— e' este numero que vai no \"1-<id>\", nao o do item.",
+               int(templateId), buf);
+}
+
+// ── O RecipeManager DO JOGADOR, e nao um qualquer ───────────────────────────
+//
+// A primeira versao disto tentava quatro alvos e aceitava o que "executou". Dois
+// executaram — `FindObject("RecipeManager")` e o CDO — e nenhum era o do
+// jogador: o primeiro devolve o PRIMEIRO objeto com esse nome no mundo, que
+// pode ser de outra pessoa, e o segundo e' o molde da classe, que nao pertence
+// a ninguem. Ensinar receita para o molde nao ensina para o Andrew.
+//
+// "Executou" nunca foi "fez efeito", e aqui a distancia entre os dois era o
+// dono do objeto.
+//
+// O golden responde onde ele mora: BasePlayerChar_C tem `RecipeManager`
+// (ObjectProperty, ref=RecipeManager) em +0x2838. E' um ponteiro dentro do
+// personagem — o do jogador que digitou o comando.
+static const uint32_t OFF_RECIPE_MANAGER = 0x2838;
+
+static void* RecipeManagerDoJogador(void* character)
+{
+    if (!character || !g_api) return nullptr;
+
+    // Pelo NOME primeiro: se a build mudar o offset, o nome continua certo, e um
+    // offset velho leria um ponteiro qualquer do meio do objeto.
+    const int32_t off = g_api->OffsetDoMembro(character, "RecipeManager");
+    const uint32_t usar = (off >= 0) ? uint32_t(off) : OFF_RECIPE_MANAGER;
+    if (off < 0)
+        g_api->Log("[engrams]   diag: a reflexao nao achou 'RecipeManager' neste "
+                   "objeto; usando o offset medido +0x%04X. Se estiver errado, a "
+                   "chamada abaixo nao executa — e' assim que se descobre.",
+                   unsigned(OFF_RECIPE_MANAGER));
+
+    void* rm = nullptr;
+    if (g_api->LerMembro(character, usar, &rm, sizeof(rm)) <= 0) return nullptr;
+    if (!rm) return nullptr;
+
+    // Ponteiro lido de dentro de objeto vivo: `Legivel` nao prova validade, mas
+    // prova que nao e' lixo obvio — e sem isso ja' derrubei este servidor.
+    if (!g_api->Legivel(rm, 0x20)) return nullptr;
+    return rm;
+}
+
+static void ChamarNoRecipeManagerDoJogador(void* character)
+{
+    void* rm = RecipeManagerDoJogador(character);
+    if (!rm)
+    {
+        g_api->Log("[engrams]   diag: nao obtive o RecipeManager DO JOGADOR "
+                   "(+0x%04X do personagem). Sem ele, chamar em outro objeto "
+                   "ensina para quem nao interessa.", unsigned(OFF_RECIPE_MANAGER));
+        return;
+    }
+    char nm[128]; nm[0] = 0;
+    g_api->NomeDoObjeto(rm, nm, int(sizeof(nm)));
+    g_api->Log("[engrams]   diag: RecipeManager do jogador = \"%s\"", nm[0] ? nm : "(sem nome)");
+    ChamarLearnOwnedDLCRecipes(rm, "RecipeManager DO JOGADOR");
+}
+
+// ── DAR O ITEM PRONTO, JA' QUE O CLIENTE NAO DEIXA FABRICAR ─────────────────
+//
+// O QUE ISTO RESOLVE, e por que so' apareceu agora
+// ------------------------------------------------
+// Em 29/08/2026 o servidor passou a autorizar tudo — o jogo parou de recusar
+// entitlement, medido no log DELE, de 1985 para 0. E mesmo assim o jogador
+// testou item por item, conferindo a via de fabricacao de cada um, e nenhum
+// aparece: nem na bancada, nem no martelo de construcao.
+//
+// A razao esta' nas RPCs. O par de posse e' SEMPRE cliente -> servidor:
+//     ClientGetDLCs(FString Key)                      servidor PERGUNTA
+//     ServerSendDLCs(TArray<uint8> EncryptedOwnedDLCs) cliente RESPONDE, cifrado
+// Nao existe RPC em que o servidor DECLARE posse ao cliente. Entao a interface
+// do cliente nunca vai oferecer o item, por mais que o servidor autorize.
+//
+// Fabricar depende do cliente pedir. Mas NASCER um item e' decisao do servidor,
+// e essa ele ja' toma a nosso favor.
+//
+// ISTO E' UMA PROVA DE CONCEITO, com UM item e resposta conhecida: o
+// `Hyrkanian Horse Stable`, template 9156, marcado DLC_Special na ItemTable —
+// o mesmo que o jogador vem tentando construir desde ontem. Se ele nascer no
+// inventario, o caminho existe e vale construir o comando inteiro. Se nao
+// nascer, o log diz o que a funcao respondeu, e nao inventamos nada.
+static const int32_t TEMPLATE_ESTABULO_HIRCANIANO = 9156;
+
+static void ProvarEntregaDeItemDoBazar(void* character)
+{
+    if (!character || !g_api) return;
+
+    const bool ok = ConanApi::Call<bool>(
+        character, "SpawnTemplateItem",
+        int32_t(TEMPLATE_ESTABULO_HIRCANIANO),
+        ConanApi::Nome("Conan-Api"),      // Context
+        int32_t(1),                       // quantity
+        float(100.0f),                    // durabilityPercentage
+        float(0.0f),                      // durability
+        bool(true));                      // ShowNotification
+
+    if (g_api->UltimaChamadaExecutou() == 0)
+    {
+        g_api->Log("[engrams]   entrega direta: SpawnTemplateItem NAO EXECUTOU. "
+                   "Sem resposta da funcao nao ha' conclusao — isto nao e' um "
+                   "\"nao\", e' um \"nao sei\".");
+        return;
+    }
+
+    g_api->Log("[engrams]   entrega direta do template %d (Hyrkanian Horse "
+               "Stable, DLC_Special): a funcao respondeu %s.",
+               int(TEMPLATE_ESTABULO_HIRCANIANO), ok ? "SIM" : "NAO");
+
+    if (ok)
+        g_api->Log("[engrams]   se o item estiver no inventario, o caminho e' "
+                   "este: o cliente nao deixa FABRICAR, mas nascer e' decisao "
+                   "do servidor. Confirme abrindo a mochila.");
+    else
+        g_api->Log("[engrams]   a funcao recusou. O spawn tambem passa por "
+                   "HasDlcOrEntitlementForItem, e esse le' um conjunto que "
+                   "nao emprestamos nesta chamada.");
+}
+
 // ── the Bazaar leg: trying the refused feats BY ID ──────────────────────────
 //
 // WHAT IS ALREADY KNOWN, measured, not assumed:
@@ -1509,9 +1909,109 @@ static void TryBazaarByRewardIds(void* controller, void* prog, Result& r)
                    "nao ha' verificador independente, e o numero acima nao "
                    "decide nada — isto NAO e' aprovacao.");
     else if (recusasDoJogo > 0)
-        g_api->Log("[engrams]   Bazaar: REPROVADO pelo jogo — ele recusou "
-                   "entitlement %d vez(es) DURANTE esta tentativa. A chave "
-                   "ainda nao e' a que ele procura.", recusasDoJogo);
+    {
+        g_api->Log("[engrams]   Bazaar: a 1a passada foi REPROVADA pelo jogo — "
+                   "ele recusou %d vez(es). Mas cada recusa diz o id que ele "
+                   "queria; usando os DELE agora.", recusasDoJogo);
+
+        // ── 2a PASSADA, COM OS IDS DO JOGO ─────────────────────────────────
+        //
+        // A 1a usa os ids da FeatTable. O jogo recusa por id de RECEITA, e em
+        // 29/08/2026 mediu-se que 1.500 dos 1.909 que ele cita sao ID DE ITEM,
+        // 1.495 deles DLC_Special. Espacos diferentes — e em vez de eu escolher
+        // a tabela, ele mesmo entrega a lista, uma linha por recusa.
+        const std::vector<int> dele = IdsQueOJogoPediuDesdeAMarca();
+        if (dele.empty())
+        {
+            g_api->Log("[engrams]   Bazaar: nao consegui extrair id nenhum das "
+                       "recusas. Sem lista do jogo nao ha' 2a passada — nao "
+                       "invento id.");
+        }
+        else
+        {
+            g_api->Log("[engrams]   Bazaar: o jogo pediu %d id(s) distinto(s). "
+                       "2a passada com eles.", int(dele.size()));
+
+            // ── RODADAS ATE' CONVERGIR ─────────────────────────────────
+            //
+            // Uma passada so' nao basta, e a medicao de 29/08 diz por que: as
+            // recusas cairam de 1995 para 562, e os 533 ids que sobraram
+            // comecam no INICIO da lista (100, 101, 102...). O emprestimo vai
+            // em lotes de 96 — o TSet tem bitmap inline para 128 — e conceder
+            // um id dispara DEPENDENCIAS que estao noutro lote. O proprio jogo
+            // tem a mensagem: "Failed to add dependent reward recipe
+            // entitlements for feat".
+            //
+            // Cada rodada satisfaz um nivel de dependencia, entao repete-se com
+            // o que sobrou. O criterio de parada NAO e' meu: e' a contagem de
+            // recusas DO JOGO parar de cair. Teto de rodadas porque um laco que
+            // so' para quando converge nao para quando nao converge.
+            const int MAX_RODADAS = 6;
+            std::vector<int> pendentes = dele;
+            int recusasAnt = recusasDoJogo;
+            int totalGanhos = 0;
+            int rodada = 0;
+
+            for (; rodada < MAX_RODADAS && !pendentes.empty(); ++rodada)
+            {
+                MarcarLogDoJogo();
+                const int g = EmprestarEReconceder(controller, prog, pendentes,
+                                                   ENTITLEMENT_TIPO_RECEITA,
+                                                   "Bazaar/2a");
+                const int rec = RecusasDoJogoDesdeAMarca();
+                totalGanhos += g;
+
+                if (rec < 0)
+                {
+                    g_api->Log("[engrams]   Bazaar/rodada %d: sem leitura do log "
+                               "— paro, porque sem verificador nao ha' criterio.",
+                               rodada + 1);
+                    break;
+                }
+
+                g_api->Log("[engrams]   Bazaar/rodada %d: %d id(s) tentados · "
+                           "%d aceitos por mim · o jogo recusou %d (antes: %d)",
+                           rodada + 1, int(pendentes.size()), g, rec, recusasAnt);
+
+                if (rec == 0)
+                {
+                    g_api->Log("[engrams]   Bazaar: o jogo PAROU de recusar, na "
+                               "rodada %d. E' o melhor sinal possivel de dentro — "
+                               "e ainda assim NAO e' prova: ele so' recusa quando "
+                               "alguem tenta usar. Confirme construindo.",
+                               rodada + 1);
+                    r.bazaarWon += totalGanhos;
+                    r.learned   += totalGanhos;
+                    break;
+                }
+
+                // Nao caiu? Insistir seria gastar tempo do servidor a toa.
+                if (rec >= recusasAnt && rodada > 0)
+                {
+                    g_api->Log("[engrams]   Bazaar: a contagem parou de cair "
+                               "(%d apos %d). O que falta nao se resolve "
+                               "repetindo — paro aqui.", rec, recusasAnt);
+                    break;
+                }
+                recusasAnt = rec;
+
+                const std::vector<int> restam = IdsQueOJogoPediuDesdeAMarca();
+                if (restam.empty() || restam.size() >= pendentes.size())
+                {
+                    g_api->Log("[engrams]   Bazaar: a lista de pendentes nao "
+                               "encolheu (%d -> %d) — paro em vez de repetir "
+                               "o mesmo.", int(pendentes.size()), int(restam.size()));
+                    break;
+                }
+                pendentes = restam;
+            }
+
+            if (rodada >= MAX_RODADAS)
+                g_api->Log("[engrams]   Bazaar: parei no teto de %d rodadas com "
+                           "%d recusa(s) ainda de pe. REPROVADO — nao converge.",
+                           MAX_RODADAS, recusasAnt);
+        }
+    }
     else
         g_api->Log("[engrams]   Bazaar: o jogo nao recusou nenhuma vez nesta "
                    "janela. E' o melhor sinal que este plugin sabe dar de dentro "
@@ -2140,6 +2640,18 @@ static Result UnlockEverything(void* controller)
         // the DLC loan is out.
         if (g_unlockBazaar && r.refused > 0)
             TryBazaarByRewardIds(controller, prog, r);
+
+        // ── PROVA DE CONCEITO: ENTREGAR O ITEM PRONTO ───────────────────────
+        //
+        // Aqui, e nao no fim: `pawn` so' existe neste escopo, e este e' o ponto
+        // onde o servidor ja' terminou de se convencer. Se o spawn falhar, todo
+        // o trabalho util acima ja' aconteceu e ja' esta' no log.
+        if (g_unlockBazaar)
+        {
+            ProvarEntregaDeItemDoBazar(pawn);
+            QualReceitaFabrica(controller, TEMPLATE_ESTABULO_HIRCANIANO);
+            ChamarNoRecipeManagerDoJogador(pawn);
+        }
 
         g_api->Log("[engrams] feats: %d walked · %d learned now · %d already had "
                    "· %d refused",
